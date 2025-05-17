@@ -1,12 +1,14 @@
+> Notice: Bark is Suno's open-source text-to-speech+ model. If you are looking for our text-to-music models, please visit us on our [web page](https://suno.ai) and join our community on [Discord](https://suno.ai/discord). 
+
+     
 # 🐶 Bark
 
-**This fork exists only to move the v2 assets into the default asset paths, and merge the available voices with those found in other projects.**
+**This fork adds batched inference, v2 default voice paths, and other improvements such as SageAttention support.**
 
-[![](https://dcbadge.vercel.app/api/server/J2B2vsjKuE?style=flat&compact=True)](https://discord.gg/J2B2vsjKuE)
-[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/OnusFM.svg?style=social&label=@OnusFM)](https://twitter.com/OnusFM)
-<a href="http://www.repostatus.org/#active"><img src="http://www.repostatus.org/badges/latest/active.svg" /></a>
+[![](https://dcbadge.vercel.app/api/server/J2B2vsjKuE?style=flat&compact=True)](https://suno.ai/discord)
+[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/FM.svg?style=social&label=@suno_ai_)](https://twitter.com/suno_ai_)
 
-[Examples](https://suno-ai.notion.site/Bark-Examples-5edae8b02a604b54a42244ba45ebc2e2) • [Suno Studio Waitlist](https://3os84zs17th.typeform.com/suno-studio) • [Updates](#-updates) • [How to Use](#-usage-in-python) • [Installation](#-installation) • [FAQ](#-faq)
+> 🔗 [Examples](https://suno.ai/examples/bark-v0) • [Suno Studio Waitlist](https://suno-ai.typeform.com/suno-studio) • [Updates](#-updates) • [How to Use](#-usage-in-python) • [Installation](#-installation) • [FAQ](#-faq)
 
 [//]: <br> (vertical spaces around image)
 <br>
@@ -20,6 +22,13 @@ Bark is a transformer-based text-to-audio model created by [Suno](https://suno.a
 ## ⚠ Disclaimer
 Bark was developed for research purposes. It is not a conventional text-to-speech model but instead a fully generative text-to-audio model, which can deviate in unexpected ways from provided prompts. Suno does not take responsibility for any output generated. Use at your own risk, and please act responsibly.
 
+## 📖 Quick Index
+* [🚀 Updates](#-updates)
+* [💻 Installation](#-installation)
+* [🐍 Usage](#-usage-in-python)
+* [🌀 Live Examples](https://suno.ai/examples/bark-v0)
+* [❓ FAQ](#-faq)
+
 ## 🎧 Demos  
 
 [![Open in Spaces](https://img.shields.io/badge/🤗-Open%20in%20Spaces-blue.svg)](https://huggingface.co/spaces/suno/bark)
@@ -32,10 +41,10 @@ Bark was developed for research purposes. It is not a conventional text-to-speec
 - ©️ Bark is now licensed under the MIT License, meaning it's now available for commercial use!  
 - ⚡ 2x speed-up on GPU. 10x speed-up on CPU. We also added an option for a smaller version of Bark, which offers additional speed-up with the trade-off of slightly lower quality. 
 - 📕 [Long-form generation](notebooks/long_form_generation.ipynb), voice consistency enhancements and other examples are now documented in a new [notebooks](./notebooks) section.
-- 👥 We created a [voice prompt library](https://suno-ai.notion.site/8b8e8749ed514b0cbf3f699013548683?v=bc67cff786b04b50b3ceb756fd05f68c). We hope this resource helps you find useful prompts for your use cases! You can also join us on [Discord](https://discord.gg/J2B2vsjKuE), where the community actively shares useful prompts in the **#audio-prompts** channel.  
+- 👥 We created a [voice prompt library](https://suno-ai.notion.site/8b8e8749ed514b0cbf3f699013548683?v=bc67cff786b04b50b3ceb756fd05f68c). We hope this resource helps you find useful prompts for your use cases! You can also join us on [Discord](https://suno.ai/discord), where the community actively shares useful prompts in the **#audio-prompts** channel.  
 - 💬 Growing community support and access to new features here: 
 
-     [![](https://dcbadge.vercel.app/api/server/J2B2vsjKuE)](https://discord.gg/J2B2vsjKuE)
+     [![](https://dcbadge.vercel.app/api/server/J2B2vsjKuE)](https://suno.ai/discord)
 
 - 💾 You can now use Bark with GPUs that have low VRAM (<4GB).
 
@@ -68,8 +77,8 @@ write_wav("bark_generation.wav", SAMPLE_RATE, audio_array)
 # play text in notebook
 Audio(audio_array, rate=SAMPLE_RATE)
 ```
-
-[pizza.webm](https://user-images.githubusercontent.com/5068315/230490503-417e688d-5115-4eee-9550-b46a2b465ee3.webm)
+     
+[pizza1.webm](https://user-images.githubusercontent.com/34592747/cfa98e54-721c-4b9c-b962-688e09db684f.webm)
 
 </details>
 
@@ -89,7 +98,18 @@ audio_array = generate_audio(text_prompt)
 ```
 [suno_korean.webm](https://user-images.githubusercontent.com/32879321/235313033-dc4477b9-2da0-4b94-9c8b-a8c2d8f5bb5e.webm)
   
-*Note: since Bark recognizes languages automatically from input text, it is possible to use for example a german history prompt with english text. This usually leads to english audio with a german accent.*
+*Note: since Bark recognizes languages automatically from input text, it is possible to use, for example, a german history prompt with english text. This usually leads to english audio with a german accent.*
+```python
+text_prompt = """
+    Der Dreißigjährige Krieg (1618-1648) war ein verheerender Konflikt, der Europa stark geprägt hat.
+    This is a beginning of the history. If you want to hear more, please continue.
+"""
+audio_array = generate_audio(text_prompt)
+```
+[suno_german_accent.webm](https://user-images.githubusercontent.com/34592747/3f96ab3e-02ec-49cb-97a6-cf5af0b3524a.webm)
+
+
+     
 
 </details>
 
@@ -111,11 +131,9 @@ audio_array = generate_audio(text_prompt)
 <details open>
 <summary><h3>🎤 Voice Presets</h3></summary>
   
-Bark supports 100+ speaker presets across [supported languages](#supported-languages). You can browse the library of speaker presets [here](https://suno-ai.notion.site/8b8e8749ed514b0cbf3f699013548683?v=bc67cff786b04b50b3ceb756fd05f68c), or in the [code](bark/assets/prompts). The community also often shares presets in [Discord](https://discord.gg/J2B2vsjKuE).
+Bark supports 100+ speaker presets across [supported languages](#supported-languages). You can browse the library of supported voice presets [HERE](https://suno-ai.notion.site/8b8e8749ed514b0cbf3f699013548683?v=bc67cff786b04b50b3ceb756fd05f68c), or in the [code](bark/assets/prompts). The community also often shares presets in [Discord](https://discord.gg/J2B2vsjKuE).
 
-Bark tries to match the tone, pitch, emotion and prosody of a given preset, but does not currently support custom voice cloning. The model also attempts to preserve music, ambient noise, etc.
-<br>
-<br>
+> Bark tries to match the tone, pitch, emotion and prosody of a given preset, but does not currently support custom voice cloning. The model also attempts to preserve music, ambient noise, etc.
 
 ```python
 text_prompt = """
@@ -128,9 +146,9 @@ audio_array = generate_audio(text_prompt, history_prompt="v2/en_speaker_1")
 [sloth.webm](https://user-images.githubusercontent.com/5068315/230684883-a344c619-a560-4ff5-8b99-b4463a34487b.webm)
 </details>
 
-### Generating Longer Audio
+### 📃 Generating Longer Audio
   
-By default, `generate_audio` works well with around 13 seconds of spoken text. For an example of how to do long-form generation, see this [example notebook](notebooks/long_form_generation.ipynb).
+By default, `generate_audio` works well with around 13 seconds of spoken text. For an example of how to do long-form generation, see 👉 **[Notebook](notebooks/long_form_generation.ipynb)** 👈
 
 <details>
 <summary>Click to toggle example long-form generations (from the example notebook)</summary>
@@ -144,21 +162,73 @@ By default, `generate_audio` works well with around 13 seconds of spoken text. F
 </details>
 
 
-
+## Command line
+```commandline
+python -m bark --text "Hello, my name is Suno." --output_filename "example.wav"
+```
 
 ## 💻 Installation
-
-```
+*‼️ CAUTION ‼️ Do NOT use `pip install bark`. It installs a different package, which is not managed by Suno.*
+```bash
 pip install git+https://github.com/suno-ai/bark.git
 ```
 
 or
 
-```
+```bash
 git clone https://github.com/suno-ai/bark
 cd bark && pip install . 
 ```
-*Note: Do NOT use 'pip install bark'. It installs a different package, which is not managed by Suno.*
+
+
+## 🤗 Transformers Usage
+
+Bark is available in the 🤗 Transformers library from version 4.31.0 onwards, requiring minimal dependencies 
+and additional packages. Steps to get started:
+
+1. First install the 🤗 [Transformers library](https://github.com/huggingface/transformers) from main:
+
+```
+pip install git+https://github.com/huggingface/transformers.git
+```
+
+2. Run the following Python code to generate speech samples:
+
+```py
+from transformers import AutoProcessor, BarkModel
+
+processor = AutoProcessor.from_pretrained("suno/bark")
+model = BarkModel.from_pretrained("suno/bark")
+
+voice_preset = "v2/en_speaker_6"
+
+inputs = processor("Hello, my dog is cute", voice_preset=voice_preset)
+
+audio_array = model.generate(**inputs)
+audio_array = audio_array.cpu().numpy().squeeze()
+```
+
+3. Listen to the audio samples either in an ipynb notebook:
+
+```py
+from IPython.display import Audio
+
+sample_rate = model.generation_config.sample_rate
+Audio(audio_array, rate=sample_rate)
+```
+
+Or save them as a `.wav` file using a third-party library, e.g. `scipy`:
+
+```py
+import scipy
+
+sample_rate = model.generation_config.sample_rate
+scipy.io.wavfile.write("bark_out.wav", rate=sample_rate, data=audio_array)
+```
+
+For more details on using the Bark model for inference using the 🤗 Transformers library, refer to the 
+[Bark docs](https://huggingface.co/docs/transformers/main/en/model_doc/bark) or the hands-on 
+[Google Colab](https://colab.research.google.com/drive/1dWWkZzvu7L9Bunq9zvD-W02RFUXoW-Pd?usp=sharing).
 
 
 ## 🛠️ Hardware and Inference Speed
@@ -170,13 +240,13 @@ On enterprise GPUs and PyTorch nightly, Bark can generate audio in roughly real-
 The full version of Bark requires around 12GB of VRAM to hold everything on GPU at the same time. 
 To use a smaller version of the models, which should fit into 8GB VRAM, set the environment flag `SUNO_USE_SMALL_MODELS=True`.
 
-If you don't have hardware available or if you want to play with bigger versions of our models, you can also sign up for early access to our model playground [here](https://3os84zs17th.typeform.com/suno-studio).
+If you don't have hardware available or if you want to play with bigger versions of our models, you can also sign up for early access to our model playground [here](https://suno-ai.typeform.com/suno-studio).
 
 ## ⚙️ Details
 
-Bark is fully generative tex-to-audio model devolved for research and demo purposes. It follows a GPT style architecture similar to [AudioLM](https://arxiv.org/abs/2209.03143) and [Vall-E](https://arxiv.org/abs/2301.02111) and a quantized Audio representation from [EnCodec](https://github.com/facebookresearch/encodec). It is not a conventional TTS model, but instead a fully generative text-to-audio model capable of deviating in unexpected ways from any given script. Different to previous approaches, the input text prompt is converted directly to audio without the intermediate use of phonemes. It can therefore generalize to arbitrary instructions beyond speech such as music lyrics, sound effects or other non-speech sounds.
+Bark is fully generative text-to-audio model devolved for research and demo purposes. It follows a GPT style architecture similar to [AudioLM](https://arxiv.org/abs/2209.03143) and [Vall-E](https://arxiv.org/abs/2301.02111) and a quantized Audio representation from [EnCodec](https://github.com/facebookresearch/encodec). It is not a conventional TTS model, but instead a fully generative text-to-audio model capable of deviating in unexpected ways from any given script. Different to previous approaches, the input text prompt is converted directly to audio without the intermediate use of phonemes. It can therefore generalize to arbitrary instructions beyond speech such as music lyrics, sound effects or other non-speech sounds.
 
-Below is a list of some known non-speech sounds, but we are finding more every day. Please let us know if you find patterns that work particularly well on [Discord](https://discord.gg/J2B2vsjKuE)!
+Below is a list of some known non-speech sounds, but we are finding more every day. Please let us know if you find patterns that work particularly well on [Discord](https://suno.ai/discord)!
 
 - `[laughter]`
 - `[laughs]`
@@ -192,7 +262,7 @@ Below is a list of some known non-speech sounds, but we are finding more every d
 ### Supported Languages
 
 | Language | Status |
-| --- | --- |
+| --- | :---: |
 | English (en) | ✅ |
 | German (de) | ✅ |
 | Spanish (es) | ✅ |
@@ -207,7 +277,7 @@ Below is a list of some known non-speech sounds, but we are finding more every d
 | Turkish (tr) | ✅ |
 | Chinese, simplified (zh) | ✅ |
 
-Requests for future language support [here](https://github.com/suno-ai/bark/discussions/111) or in the **#forums** channel on [Discord](https://discord.com/invite/J2B2vsjKuE). 
+Requests for future language support [here](https://github.com/suno-ai/bark/discussions/111) or in the **#forums** channel on [Discord](https://suno.ai/discord). 
 
 ## 🙏 Appreciation
 
@@ -220,18 +290,16 @@ Requests for future language support [here](https://github.com/suno-ai/bark/disc
 
 Bark is licensed under the MIT License. 
 
-Please contact us at `bark@suno.ai` to request access to a larger version of the model.  
-
 ## 📱 Community
 
-- [Twitter](https://twitter.com/OnusFM)
-- [Discord](https://discord.gg/J2B2vsjKuE)
+- [Twitter](https://twitter.com/suno_ai_)
+- [Discord](https://suno.ai/discord)
 
 ## 🎧 Suno Studio (Early Access)
 
 We’re developing a playground for our models, including Bark. 
 
-If you are interested, you can sign up for early access [here](https://3os84zs17th.typeform.com/suno-studio).
+If you are interested, you can sign up for early access [here](https://suno-ai.typeform.com/suno-studio).
 
 ## ❓ FAQ
 
@@ -243,7 +311,7 @@ If you are interested, you can sign up for early access [here](https://3os84zs17
 * Bark is a GPT-style model. As such, it may take some creative liberties in its generations, resulting in higher-variance model outputs than traditional text-to-speech approaches.
 
 #### What voices are supported by Bark?  
-* Bark supports 100+ speaker presets across [supported languages](#supported-languages). You can browse the library of speaker presets [here](https://suno-ai.notion.site/8b8e8749ed514b0cbf3f699013548683?v=bc67cff786b04b50b3ceb756fd05f68c). The community also shares presets in [Discord](https://discord.gg/J2B2vsjKuE). Bark also supports generating unique random voices that fit the input text. Bark does not currently support custom voice cloning.
+* Bark supports 100+ speaker presets across [supported languages](#supported-languages). You can browse the library of speaker presets [here](https://suno-ai.notion.site/8b8e8749ed514b0cbf3f699013548683?v=bc67cff786b04b50b3ceb756fd05f68c). The community also shares presets in [Discord](https://suno.ai/discord). Bark also supports generating unique random voices that fit the input text. Bark does not currently support custom voice cloning.
 
 #### Why is the output limited to ~13-14 seconds?
 * Bark is a GPT-style model, and its architecture/context window is optimized to output generations with roughly this length.
@@ -253,8 +321,8 @@ If you are interested, you can sign up for early access [here](https://3os84zs17
 
 ```python
 import os
-os.environ["SUNO_OFFLOAD_CPU"] = True
-os.environ["SUNO_USE_SMALL_MODELS"] = True
+os.environ["SUNO_OFFLOAD_CPU"] = "True"
+os.environ["SUNO_USE_SMALL_MODELS"] = "True"
 ```
 
 #### My generated audio sounds like a 1980s phone call. What's happening?
