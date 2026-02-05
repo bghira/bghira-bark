@@ -7,7 +7,6 @@ from encodec import EncodecModel
 import funcy
 import logging
 import numpy as np
-from scipy.special import softmax
 import torch
 import torch.nn.functional as F
 import tqdm
@@ -17,6 +16,18 @@ from typing import Optional
 
 from .model import GPTConfig, GPT
 from .model_fine import FineGPT, FineGPTConfig
+
+
+def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Zero-copy GPU top-p (nucleus) filtering. Modifies logits in-place."""
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    sorted_probs = F.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    # Shift right so the token that pushes past top_p is kept
+    remove_mask = (cumulative_probs - sorted_probs) >= top_p
+    sorted_logits[remove_mask] = -float("inf")
+    logits.scatter_(0, sorted_indices, sorted_logits)
+    return logits
 
 _TORCH23_PLUS = tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (2, 3)
 
@@ -195,7 +206,6 @@ def _inference_mode():
 def _clear_cuda_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
 
 
 def clean_models(model_key=None):
@@ -476,17 +486,9 @@ def generate_text_semantic(
             if allow_early_stop:
                 relevant_logits = torch.concat([relevant_logits, logits[[SEMANTIC_PAD_TOKEN]]])
 
-            # top‑p / top‑k filtering
+            # top‑p / top‑k filtering (all on-device, no CPU round-trip)
             if top_p is not None:
-                cpu_logits = relevant_logits.detach().cpu().float().numpy()
-                order = np.argsort(cpu_logits)[::-1]
-                cum = np.cumsum(softmax(cpu_logits[order]))
-                cpu_logits[order[cum > top_p]] = -np.inf
-                relevant_logits = (
-                    torch.from_numpy(cpu_logits)
-                    .to(relevant_logits.device)
-                    .type(relevant_logits.dtype)
-                )
+                relevant_logits = _top_p_filter(relevant_logits, top_p)
             if top_k is not None:
                 v, _ = torch.topk(relevant_logits, min(top_k, relevant_logits.numel()))
                 relevant_logits[relevant_logits < v[-1]] = -float("inf")
@@ -498,9 +500,9 @@ def generate_text_semantic(
             else:
                 sample = torch.multinomial(probs, 1)
 
-            # Early‑stop check --------------------------------------------------
+            # Early‑stop check (compare on device to avoid GPU sync per step)
             if allow_early_stop and (
-                sample.item() == SEMANTIC_VOCAB_SIZE or (min_eos_p and probs[-1] >= min_eos_p)
+                (sample == SEMANTIC_VOCAB_SIZE).item() or (min_eos_p and probs[-1] >= min_eos_p)
             ):
                 n -= 1  # exclude eos from slice
                 pbar.update(n + 1 - pbar.n)
@@ -526,10 +528,9 @@ def generate_text_semantic(
 
 def _flatten_codebooks(arr, offset_size=CODEBOOK_SIZE):
     assert len(arr.shape) == 2
-    arr = arr.copy()
     if offset_size is not None:
-        for n in range(1, arr.shape[0]):
-            arr[n, :] += offset_size * n
+        offsets = np.arange(arr.shape[0])[:, None] * offset_size
+        arr = arr + offsets
     flat_arr = arr.ravel("F")
     return flat_arr
 
@@ -621,7 +622,17 @@ def generate_coarse(
     base_semantic_idx = len(x_semantic_history)
     with _inference_mode():
         x_semantic_in = torch.from_numpy(x_semantic)[None].to(device)
-        x_coarse_in = torch.from_numpy(x_coarse)[None].to(device)
+        # Pre-allocate x_coarse_in with room for all new tokens (avoids O(n^2) torch.cat)
+        x_coarse_base = torch.from_numpy(x_coarse)[None].to(device)
+        n_coarse_history = x_coarse_base.shape[1]
+        x_coarse_in = torch.empty(
+            (1, n_coarse_history + n_steps), dtype=x_coarse_base.dtype, device=device
+        )
+        x_coarse_in[:, :n_coarse_history] = x_coarse_base
+        del x_coarse_base
+        coarse_write_idx = n_coarse_history
+        # Hoist constant token tensor outside loop
+        infer_token = torch.tensor([COARSE_INFER_TOKEN], dtype=torch.long, device=device)[None]
         n_window_steps = int(np.ceil(n_steps / sliding_window_len))
         n_step = 0
         for _ in tqdm.tqdm(range(n_window_steps), total=n_window_steps, disable=silent):
@@ -635,13 +646,16 @@ def generate_coarse(
                 "constant",
                 COARSE_SEMANTIC_PAD_TOKEN,
             )
-            x_in = torch.hstack(
-                [
-                    x_in,
-                    torch.tensor([COARSE_INFER_TOKEN])[None].to(device),
-                    x_coarse_in[:, -max_coarse_history:],
-                ]
+            coarse_tail = x_coarse_in[:, max(0, coarse_write_idx - max_coarse_history):coarse_write_idx]
+            # Pre-allocate x_in with room for sliding_window_len new tokens
+            x_in_prefix = torch.hstack([x_in, infer_token, coarse_tail])
+            prefix_len = x_in_prefix.shape[1]
+            x_in = torch.empty(
+                (1, prefix_len + sliding_window_len), dtype=x_in_prefix.dtype, device=device
             )
+            x_in[:, :prefix_len] = x_in_prefix
+            del x_in_prefix
+            x_in_write_idx = prefix_len
             kv_cache = None
             for _ in range(sliding_window_len):
                 if n_step >= n_steps:
@@ -649,28 +663,16 @@ def generate_coarse(
                 is_major_step = n_step % N_COARSE_CODEBOOKS == 0
 
                 if use_kv_caching and kv_cache is not None:
-                    x_input = x_in[:, [-1]]
+                    x_input = x_in[:, [x_in_write_idx - 1]]
                 else:
-                    x_input = x_in
+                    x_input = x_in[:, :x_in_write_idx]
 
                 logits, kv_cache = model(x_input, use_cache=use_kv_caching, past_kv=kv_cache)
                 logit_start_idx = SEMANTIC_VOCAB_SIZE + (1 - int(is_major_step)) * CODEBOOK_SIZE
                 logit_end_idx = SEMANTIC_VOCAB_SIZE + (2 - int(is_major_step)) * CODEBOOK_SIZE
                 relevant_logits = logits[0, 0, logit_start_idx:logit_end_idx]
                 if top_p is not None:
-                    # faster to convert to numpy
-                    logits_device = relevant_logits.device
-                    logits_dtype = relevant_logits.type()
-                    relevant_logits = relevant_logits.detach().cpu().type(torch.float32).numpy()
-                    sorted_indices = np.argsort(relevant_logits)[::-1]
-                    sorted_logits = relevant_logits[sorted_indices]
-                    cumulative_probs = np.cumsum(softmax(sorted_logits))
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].copy()
-                    sorted_indices_to_remove[0] = False
-                    relevant_logits[sorted_indices[sorted_indices_to_remove]] = -np.inf
-                    relevant_logits = torch.from_numpy(relevant_logits)
-                    relevant_logits = relevant_logits.to(logits_device).type(logits_dtype)
+                    relevant_logits = _top_p_filter(relevant_logits, top_p)
                 if top_k is not None:
                     v, _ = torch.topk(relevant_logits, min(top_k, relevant_logits.size(-1)))
                     relevant_logits[relevant_logits < v[-1]] = -float("Inf")
@@ -683,20 +685,21 @@ def generate_coarse(
                 probs = probs.to(inf_device)
                 item_next = item_next.to(inf_device)
                 item_next += logit_start_idx
-                x_coarse_in = torch.cat((x_coarse_in, item_next[None]), dim=1)
-                x_in = torch.cat((x_in, item_next[None]), dim=1)
+                x_coarse_in[0, coarse_write_idx] = item_next
+                x_in[0, x_in_write_idx] = item_next
+                coarse_write_idx += 1
+                x_in_write_idx += 1
                 del logits, relevant_logits, probs, item_next
                 n_step += 1
             del x_in
         del x_semantic_in
     if OFFLOAD_CPU:
         model.to("cpu")
-    gen_coarse_arr = x_coarse_in.detach().cpu().numpy().squeeze()[len(x_coarse_history) :]
+    gen_coarse_arr = x_coarse_in.detach().cpu().numpy().squeeze()[n_coarse_history:]
     del x_coarse_in
     assert len(gen_coarse_arr) == n_steps
     gen_coarse_audio_arr = gen_coarse_arr.reshape(-1, N_COARSE_CODEBOOKS).T - SEMANTIC_VOCAB_SIZE
-    for n in range(1, N_COARSE_CODEBOOKS):
-        gen_coarse_audio_arr[n, :] -= n * CODEBOOK_SIZE
+    gen_coarse_audio_arr -= np.arange(N_COARSE_CODEBOOKS)[:, None] * CODEBOOK_SIZE
     _clear_cuda_cache()
     return gen_coarse_audio_arr
 
@@ -784,18 +787,14 @@ def generate_fine(
                     relevant_logits = logits[0, rel_start_fill_idx:, :CODEBOOK_SIZE]
                     codebook_preds = torch.argmax(relevant_logits, -1)
                 else:
-                    relevant_logits = logits[0, :, :CODEBOOK_SIZE] / temp
+                    relevant_logits = logits[0, rel_start_fill_idx:, :CODEBOOK_SIZE] / temp
                     probs = F.softmax(relevant_logits, dim=-1)
                     # multinomial bugged on mps: shuttle to cpu if necessary
                     inf_device = probs.device
                     if probs.device.type == "mps":
                         probs = probs.to("cpu")
-                    codebook_preds = torch.hstack(
-                        [
-                            torch.multinomial(probs[nnn], num_samples=1).to(inf_device)
-                            for nnn in range(rel_start_fill_idx, 1024)
-                        ]
-                    )
+                    # Batched multinomial instead of per-row loop
+                    codebook_preds = torch.multinomial(probs, num_samples=1).squeeze(-1).to(inf_device)
                 in_buffer[0, rel_start_fill_idx:, nn] = codebook_preds
                 del logits, codebook_preds
             # transfer over info into model_in and convert to numpy
