@@ -1,12 +1,10 @@
 # Example Prompts Data
 
 ## Version Two
-The `v2` prompts are better engineered to follow text with a consistent voice.
-To use them, simply include `v2` in the prompt. For example
 ```python
 from bark import generate_audio
 text_prompt = "madam I'm adam"
-audio_array = generate_audio(text_prompt, history_prompt="v2/en_speaker_1")
+audio_array = generate_audio(text_prompt, history_prompt="en_speaker_1")
 ```
 
 ## Prompt Format

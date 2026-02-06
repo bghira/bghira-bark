@@ -19,14 +19,14 @@ from .model_fine import FineGPT, FineGPTConfig
 
 
 def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-    """Zero-copy GPU top-p (nucleus) filtering. Modifies logits in-place."""
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    """GPU top-p (nucleus) filtering. Works on 1-D (V,) or 2-D (B, V) logits."""
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
     sorted_probs = F.softmax(sorted_logits, dim=-1)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
     # Shift right so the token that pushes past top_p is kept
     remove_mask = (cumulative_probs - sorted_probs) >= top_p
     sorted_logits[remove_mask] = -float("inf")
-    logits.scatter_(0, sorted_indices, sorted_logits)
+    logits.scatter_(-1, sorted_indices, sorted_logits)
     return logits
 
 _TORCH23_PLUS = tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (2, 3)
@@ -283,7 +283,9 @@ def _load_codec_model(device: str):
 
 
 def load_model(use_gpu=True, use_small=False, force_reload=False, model_type="text"):
-    _load_model_f = funcy.partial(_load_model, model_type=model_type, use_small=use_small)
+    _load_model_f = funcy.partial(
+        _load_model, model_type=model_type, use_small=use_small,
+    )
     if model_type not in ("text", "coarse", "fine"):
         raise NotImplementedError()
     global models
@@ -348,7 +350,8 @@ def preload_models(
     ):
         logger.warning("No GPU being used. Careful, inference might be very slow!")
     _ = load_model(
-        model_type="text", use_gpu=text_use_gpu, use_small=text_use_small, force_reload=force_reload
+        model_type="text", use_gpu=text_use_gpu, use_small=text_use_small,
+        force_reload=force_reload,
     )
     _ = load_model(
         model_type="coarse",
@@ -837,3 +840,542 @@ def codec_decode(fine_tokens):
     if OFFLOAD_CPU:
         model.to("cpu")
     return audio_arr
+
+
+# ── Batched generation ──────────────────────────────────────────────────────
+
+
+def generate_text_semantic_batched(
+    texts: list[str],
+    history_prompts: list = None,
+    *,
+    temp: float = 0.7,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    silent: bool = False,
+    min_eos_p: float = 0.2,
+    max_gen_duration_s: float | None = None,
+    allow_early_stop: bool = True,
+    use_kv_caching: bool = True,
+) -> list[np.ndarray]:
+    """Batched semantic-token generation for *B* texts at once.
+
+    All sequences share the same prefill length (513 tokens) so no
+    padding masks are needed — the causal GPT handles batch>1 natively.
+    """
+    B = len(texts)
+    if not B:
+        return []
+    if history_prompts is None:
+        history_prompts = [None] * B
+
+    # ── load model & tokenizer ──────────────────────────────────────────
+    global models, models_devices
+    if "text" not in models:
+        preload_models()
+    container = models["text"]
+    model, tokenizer = container["model"], container["tokenizer"]
+    if OFFLOAD_CPU:
+        model.to(models_devices["text"])
+    device = next(model.parameters()).device
+
+    # ── build [B, 513] input ────────────────────────────────────────────
+    rows = []
+    for i in range(B):
+        text = _normalize_whitespace(texts[i])
+        if not text:
+            raise ValueError(f"Prompt {i} is empty")
+
+        tok = np.array(_tokenize(tokenizer, text)) + TEXT_ENCODING_OFFSET
+        if tok.size > 256:
+            tok = tok[:256]
+        tok = np.pad(tok, (0, 256 - tok.size), constant_values=TEXT_PAD_TOKEN)
+
+        if history_prompts[i] is not None:
+            hp = _load_history_prompt(history_prompts[i])
+            sem_hist = hp["semantic_prompt"].astype(np.int64)[-256:]
+            sem_hist = np.pad(
+                sem_hist, (0, 256 - sem_hist.size), constant_values=SEMANTIC_PAD_TOKEN
+            )
+        else:
+            sem_hist = np.full(256, SEMANTIC_PAD_TOKEN, dtype=np.int64)
+
+        rows.append(np.hstack([tok, sem_hist, [SEMANTIC_INFER_TOKEN]]).astype(np.int64))
+
+    x = torch.from_numpy(np.stack(rows)).to(device)  # [B, 513]
+    n_tot_steps = 768
+    x_initial = x.shape[1]
+    # pre-allocate output slots filled with pad (safe to feed for finished seqs)
+    x = torch.cat(
+        [x, torch.full((B, n_tot_steps), SEMANTIC_PAD_TOKEN, dtype=torch.long, device=device)],
+        dim=1,
+    )
+
+    kv_cache = None
+    active = torch.ones(B, dtype=torch.bool, device=device)
+    gen_lens = torch.full((B,), n_tot_steps, dtype=torch.long, device=device)
+    pbar = tqdm.tqdm(total=n_tot_steps, disable=silent)
+
+    with _inference_mode():
+        for n in range(n_tot_steps):
+            if use_kv_caching and kv_cache is not None:
+                x_input = x[:, [x_initial + n - 1]]
+            else:
+                x_input = x[:, : x_initial + n]
+
+            logits, kv_cache = model(
+                x_input, merge_context=True, use_cache=use_kv_caching, past_kv=kv_cache
+            )
+            logits = logits[:, 0, :]  # [B, vocab]
+            relevant_logits = logits[:, :SEMANTIC_VOCAB_SIZE]
+            if allow_early_stop:
+                relevant_logits = torch.cat(
+                    [relevant_logits, logits[:, SEMANTIC_PAD_TOKEN : SEMANTIC_PAD_TOKEN + 1]],
+                    dim=-1,
+                )
+
+            # top-p / top-k (operates per-row for 2-D tensors)
+            if top_p is not None:
+                relevant_logits = _top_p_filter(relevant_logits, top_p)
+            if top_k is not None:
+                v, _ = torch.topk(
+                    relevant_logits, min(top_k, relevant_logits.size(-1)), dim=-1
+                )
+                relevant_logits[relevant_logits < v[:, [-1]]] = -float("inf")
+
+            probs = F.softmax(relevant_logits / temp, dim=-1)
+            if probs.device.type == "mps":
+                samples = torch.multinomial(probs.cpu(), 1).to(probs.device)
+            else:
+                samples = torch.multinomial(probs, 1)
+            samples = samples.squeeze(-1)  # [B]
+
+            # early-stop bookkeeping
+            if allow_early_stop:
+                is_eos = samples == SEMANTIC_VOCAB_SIZE
+                if min_eos_p:
+                    is_eos = is_eos | (probs[:, -1] >= min_eos_p)
+                just_finished = active & is_eos
+                gen_lens[just_finished] = n  # n tokens at indices 0..n-1
+                active &= ~just_finished
+
+            x[active, x_initial + n] = samples[active]
+            pbar.update(1)
+
+            if not active.any():
+                break
+            if max_gen_duration_s and (n + 1) / SEMANTIC_RATE_HZ > max_gen_duration_s:
+                gen_lens[active] = n + 1
+                break
+    pbar.close()
+
+    if OFFLOAD_CPU:
+        model.to("cpu")
+
+    x_cpu = x.detach().cpu().numpy()
+    results = []
+    for b in range(B):
+        L = gen_lens[b].item()
+        out = x_cpu[b, x_initial : x_initial + L]
+        assert (0 <= out).all() and (out < SEMANTIC_VOCAB_SIZE).all()
+        results.append(out)
+
+    _clear_cuda_cache()
+    return results
+
+
+def generate_coarse_batched(
+    x_semantics: list[np.ndarray],
+    history_prompts: list = None,
+    *,
+    temp: float = 0.7,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    silent: bool = False,
+    max_coarse_history: int = 630,
+    sliding_window_len: int = 60,
+    use_kv_caching: bool = True,
+) -> list[np.ndarray]:
+    """Batched coarse-code generation from semantic tokens.
+
+    Supports heterogeneous history prompts.  Each sequence gets its own
+    semantic/coarse history, padded into a common buffer so the model
+    forward pass runs with batch > 1.
+    """
+    B = len(x_semantics)
+    if not B:
+        return []
+    if history_prompts is None:
+        history_prompts = [None] * B
+
+    assert 60 <= max_coarse_history <= 630
+    assert max_coarse_history + sliding_window_len <= 1024 - 256
+    semantic_to_coarse_ratio = COARSE_RATE_HZ / SEMANTIC_RATE_HZ * N_COARSE_CODEBOOKS
+    max_semantic_history = int(np.floor(max_coarse_history / semantic_to_coarse_ratio))
+
+    # ── per-sequence preprocessing ──────────────────────────────────────
+    all_x_semantic = []      # full semantic (history + new) per seq
+    all_x_coarse_hist = []   # flattened coarse history per seq
+    all_base_sem_idx = []    # where new semantic tokens start per seq
+    all_n_steps = []         # coarse steps to generate per seq
+
+    for b in range(B):
+        x_sem = x_semantics[b]
+        assert x_sem.ndim == 1 and x_sem.min() >= 0 and x_sem.max() <= SEMANTIC_VOCAB_SIZE - 1
+        hp = history_prompts[b]
+        if hp is not None:
+            hp = _load_history_prompt(hp)
+            x_sem_hist = hp["semantic_prompt"]
+            x_coarse_hist = hp["coarse_prompt"]
+            x_coarse_hist = _flatten_codebooks(x_coarse_hist) + SEMANTIC_VOCAB_SIZE
+            n_sem_hist = int(np.min([
+                max_semantic_history,
+                len(x_sem_hist) - len(x_sem_hist) % 2,
+                int(np.floor(len(x_coarse_hist) / semantic_to_coarse_ratio)),
+            ]))
+            n_coarse_hist = int(round(n_sem_hist * semantic_to_coarse_ratio))
+            x_sem_hist = x_sem_hist[-n_sem_hist:].astype(np.int32)
+            x_coarse_hist = x_coarse_hist[-n_coarse_hist:].astype(np.int32)
+            x_coarse_hist = x_coarse_hist[:-2]  # time-alignment hack
+        else:
+            x_sem_hist = np.array([], dtype=np.int32)
+            x_coarse_hist = np.array([], dtype=np.int32)
+
+        all_base_sem_idx.append(len(x_sem_hist))
+        all_x_semantic.append(np.hstack([x_sem_hist, x_sem]).astype(np.int32))
+        all_x_coarse_hist.append(x_coarse_hist)
+
+        n_steps = int(round(
+            np.floor(len(x_sem) * semantic_to_coarse_ratio / N_COARSE_CODEBOOKS)
+            * N_COARSE_CODEBOOKS
+        ))
+        assert n_steps > 0 and n_steps % N_COARSE_CODEBOOKS == 0
+        all_n_steps.append(n_steps)
+
+    n_steps_max = max(all_n_steps)
+    max_coarse_hist_len = max(len(h) for h in all_x_coarse_hist)
+
+    # pad semantics to common length
+    max_sem_len = max(s.size for s in all_x_semantic)
+    x_sem_padded = np.zeros((B, max_sem_len), dtype=np.int32)
+    for i, s in enumerate(all_x_semantic):
+        x_sem_padded[i, :s.size] = s
+
+    # ── load model ──────────────────────────────────────────────────────
+    global models, models_devices
+    if "coarse" not in models:
+        preload_models()
+    model = models["coarse"]
+    if OFFLOAD_CPU:
+        model.to(models_devices["coarse"])
+    device = next(model.parameters()).device
+
+    with _inference_mode():
+        x_semantic_in = torch.from_numpy(x_sem_padded).to(device)  # [B, max_sem_len]
+
+        # pre-allocate coarse buffer [B, max_coarse_hist + n_steps_max]
+        # each row is right-aligned: history sits at the end of the hist region
+        total_coarse_cols = max_coarse_hist_len + n_steps_max
+        x_coarse_in = torch.zeros(
+            (B, total_coarse_cols), dtype=torch.long, device=device
+        )
+        # per-sequence: write history right-aligned into [0..max_coarse_hist_len)
+        for b in range(B):
+            h = all_x_coarse_hist[b]
+            if len(h) > 0:
+                ht = torch.from_numpy(h).to(device)
+                x_coarse_in[b, max_coarse_hist_len - len(h) : max_coarse_hist_len] = ht
+
+        coarse_write_idx = max_coarse_hist_len  # all new tokens start here
+
+        infer_token = torch.tensor(
+            [COARSE_INFER_TOKEN], dtype=torch.long, device=device
+        ).unsqueeze(0).expand(B, -1)
+
+        # per-sequence base_sem_idx as tensor for vectorised offset computation
+        base_sem_idx_t = torch.tensor(all_base_sem_idx, device=device)
+
+        n_window_steps = int(np.ceil(n_steps_max / sliding_window_len))
+        n_step = 0
+
+        for _ in tqdm.tqdm(range(n_window_steps), total=n_window_steps, disable=silent):
+            # ── build per-sequence semantic context [B, 256] ────────
+            # semantic_idx per seq = base_sem_idx[b] + round(n_step / ratio)
+            sem_offset = int(round(n_step / semantic_to_coarse_ratio))
+            # per-seq start into x_semantic_in
+            sem_idx_per_seq = [all_base_sem_idx[b] + sem_offset for b in range(B)]
+            sem_ctx = torch.full(
+                (B, 256), COARSE_SEMANTIC_PAD_TOKEN, dtype=torch.long, device=device
+            )
+            for b in range(B):
+                si = sem_idx_per_seq[b]
+                start = max(0, si - max_semantic_history)
+                end = min(start + 256, x_semantic_in.shape[1])
+                width = end - start
+                sem_ctx[b, :width] = x_semantic_in[b, start:end]
+
+            # ── coarse tail context ─────────────────────────────────
+            # each sequence sees its own history region + generated tokens
+            # tail = last max_coarse_history tokens of x_coarse_in[:, :coarse_write_idx]
+            tail_start = max(0, coarse_write_idx - max_coarse_history)
+            coarse_tail = x_coarse_in[:, tail_start:coarse_write_idx]
+
+            x_in_prefix = torch.cat([sem_ctx, infer_token, coarse_tail], dim=1)
+            prefix_len = x_in_prefix.shape[1]
+            x_in = torch.empty(
+                (B, prefix_len + sliding_window_len),
+                dtype=x_in_prefix.dtype, device=device,
+            )
+            x_in[:, :prefix_len] = x_in_prefix
+            del x_in_prefix
+            x_in_write_idx = prefix_len
+
+            kv_cache = None
+            for _ in range(sliding_window_len):
+                if n_step >= n_steps_max:
+                    break
+                is_major_step = n_step % N_COARSE_CODEBOOKS == 0
+
+                if use_kv_caching and kv_cache is not None:
+                    x_input = x_in[:, [x_in_write_idx - 1]]
+                else:
+                    x_input = x_in[:, :x_in_write_idx]
+
+                logits, kv_cache = model(
+                    x_input, use_cache=use_kv_caching, past_kv=kv_cache
+                )
+                logit_start_idx = (
+                    SEMANTIC_VOCAB_SIZE + (1 - int(is_major_step)) * CODEBOOK_SIZE
+                )
+                logit_end_idx = (
+                    SEMANTIC_VOCAB_SIZE + (2 - int(is_major_step)) * CODEBOOK_SIZE
+                )
+                relevant_logits = logits[:, 0, logit_start_idx:logit_end_idx]
+
+                if top_p is not None:
+                    relevant_logits = _top_p_filter(relevant_logits, top_p)
+                if top_k is not None:
+                    v, _ = torch.topk(
+                        relevant_logits, min(top_k, relevant_logits.size(-1)), dim=-1
+                    )
+                    relevant_logits[relevant_logits < v[:, [-1]]] = -float("inf")
+
+                probs = F.softmax(relevant_logits / temp, dim=-1)
+                inf_device = probs.device
+                if probs.device.type == "mps":
+                    probs = probs.to("cpu")
+                item_next = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                item_next = item_next.to(inf_device) + logit_start_idx
+
+                x_coarse_in[:, coarse_write_idx] = item_next
+                x_in[:, x_in_write_idx] = item_next
+                coarse_write_idx += 1
+                x_in_write_idx += 1
+                del logits, relevant_logits, probs, item_next
+                n_step += 1
+            del x_in
+        del x_semantic_in
+
+    if OFFLOAD_CPU:
+        model.to("cpu")
+
+    # extract per-sequence results, trimmed to real n_steps
+    x_coarse_cpu = x_coarse_in.detach().cpu().numpy()
+    del x_coarse_in
+    results = []
+    for b in range(B):
+        ns = all_n_steps[b]
+        gen = x_coarse_cpu[b, max_coarse_hist_len : max_coarse_hist_len + ns]
+        gen_audio = gen.reshape(-1, N_COARSE_CODEBOOKS).T - SEMANTIC_VOCAB_SIZE
+        gen_audio -= np.arange(N_COARSE_CODEBOOKS)[:, None] * CODEBOOK_SIZE
+        results.append(gen_audio)
+
+    _clear_cuda_cache()
+    return results
+
+
+def generate_fine_batched(
+    x_coarse_gens: list[np.ndarray],
+    history_prompts: list = None,
+    *,
+    temp: float = 0.6,
+    silent: bool = True,
+) -> list[np.ndarray]:
+    """Batched fine-code generation.  FineGPT already supports pad_mask.
+
+    Supports heterogeneous history prompts.  Each sequence's history is
+    right-aligned into a common prefix region so the 1024-token sliding
+    window schedule is uniform across the batch.
+    """
+    B = len(x_coarse_gens)
+    if not B:
+        return []
+    if history_prompts is None:
+        history_prompts = [None] * B
+
+    # ── per-sequence input arrays ───────────────────────────────────────
+    n_coarse = x_coarse_gens[0].shape[0]
+    all_in_arr = []
+    all_coarse_len = []
+    all_n_history = []
+
+    for i in range(B):
+        x_cg = x_coarse_gens[i]
+        assert x_cg.ndim == 2 and x_cg.min() >= 0 and x_cg.max() <= CODEBOOK_SIZE - 1
+        all_coarse_len.append(x_cg.shape[1])
+
+        hp = history_prompts[i]
+        if hp is not None:
+            hp = _load_history_prompt(hp)
+            x_fine_hist = hp["fine_prompt"].astype(np.int32)[:, -512:]
+            all_n_history.append(x_fine_hist.shape[1])
+        else:
+            x_fine_hist = None
+            all_n_history.append(0)
+
+        in_arr = np.vstack([
+            x_cg,
+            np.zeros((N_FINE_CODEBOOKS - n_coarse, x_cg.shape[1]), dtype=np.int32) + CODEBOOK_SIZE,
+        ])
+        if x_fine_hist is not None:
+            in_arr = np.hstack([x_fine_hist, in_arr])
+        all_in_arr.append(in_arr)
+
+    # use max history length for the uniform window schedule
+    max_n_history = max(all_n_history)
+
+    # right-align histories: pad each sequence on the left so that
+    # the boundary between history and new tokens is at column max_n_history
+    all_in_arr_aligned = []
+    for i in range(B):
+        left_pad = max_n_history - all_n_history[i]
+        if left_pad > 0:
+            pad_block = np.full(
+                (N_FINE_CODEBOOKS, left_pad), CODEBOOK_SIZE, dtype=np.int32
+            )
+            all_in_arr_aligned.append(np.hstack([pad_block, all_in_arr[i]]))
+        else:
+            all_in_arr_aligned.append(all_in_arr[i])
+
+    # pad to common temporal length (at least 1024)
+    max_T_raw = max(a.shape[1] for a in all_in_arr_aligned)
+    max_T = max(max_T_raw, 1024)
+    padded = np.full((B, N_FINE_CODEBOOKS, max_T), CODEBOOK_SIZE, dtype=np.int32)
+    for i in range(B):
+        T = all_in_arr_aligned[i].shape[1]
+        padded[i, :, :T] = all_in_arr_aligned[i]
+
+    # ── load model ──────────────────────────────────────────────────────
+    global models, models_devices
+    if "fine" not in models:
+        preload_models()
+    model = models["fine"]
+    if OFFLOAD_CPU:
+        model.to(models_devices["fine"])
+    device = next(model.parameters()).device
+
+    max_coarse_len = max(all_coarse_len)
+    n_loops = max(0, int(np.ceil((max_coarse_len - (1024 - max_n_history)) / 512))) + 1
+
+    with _inference_mode():
+        # [B, max_T, n_codes]  (temporal dim first for slicing)
+        in_arr_t = torch.from_numpy(padded.transpose(0, 2, 1)).to(device)
+
+        for n in tqdm.tqdm(range(n_loops), disable=silent):
+            start_idx = min(n * 512, max_T - 1024)
+            start_fill_idx = min(max_n_history + n * 512, max_T - 512)
+            rel_start_fill_idx = start_fill_idx - start_idx
+            in_buffer = in_arr_t[:, start_idx : start_idx + 1024, :].clone()
+
+            for nn in range(n_coarse, N_FINE_CODEBOOKS):
+                logits = model(nn, in_buffer)
+                if temp is None:
+                    relevant_logits = logits[:, rel_start_fill_idx:, :CODEBOOK_SIZE]
+                    codebook_preds = torch.argmax(relevant_logits, -1)
+                else:
+                    relevant_logits = logits[:, rel_start_fill_idx:, :CODEBOOK_SIZE] / temp
+                    probs = F.softmax(relevant_logits, dim=-1)
+                    inf_device = probs.device
+                    if probs.device.type == "mps":
+                        probs = probs.to("cpu")
+                    flat = probs.reshape(-1, probs.shape[-1])
+                    codebook_preds = (
+                        torch.multinomial(flat, 1).squeeze(-1).to(inf_device)
+                        .reshape(probs.shape[0], probs.shape[1])
+                    )
+                in_buffer[:, rel_start_fill_idx:, nn] = codebook_preds
+                del logits, codebook_preds
+
+            in_arr_t[:, start_fill_idx : start_fill_idx + (1024 - rel_start_fill_idx), :] = (
+                in_buffer[:, rel_start_fill_idx:, :]
+            )
+            del in_buffer
+
+        gen_fine_all = in_arr_t.detach().cpu().numpy()  # [B, max_T, n_codes]
+        del in_arr_t
+
+    if OFFLOAD_CPU:
+        model.to("cpu")
+
+    results = []
+    for b in range(B):
+        g = gen_fine_all[b].T  # [n_codes, max_T]
+        g = g[:, max_n_history : max_n_history + all_coarse_len[b]]
+        assert g.shape[-1] == all_coarse_len[b]
+        results.append(g)
+
+    _clear_cuda_cache()
+    return results
+
+
+def codec_decode_batched(fine_tokens_list: list[np.ndarray]) -> list[np.ndarray]:
+    """Decode a list of fine-token arrays into audio waveforms.
+
+    Pads to common length, runs EnCodec in one forward pass, then trims each
+    output to its original sample count.
+    """
+    if not fine_tokens_list:
+        return []
+
+    global models, models_devices
+    if "codec" not in models:
+        preload_models()
+    model = models["codec"]
+    if OFFLOAD_CPU:
+        model.to(models_devices["codec"])
+    device = next(model.parameters()).device
+
+    lengths = [ft.shape[1] for ft in fine_tokens_list]
+    max_len = max(lengths)
+    B = len(fine_tokens_list)
+
+    padded = np.zeros((B, fine_tokens_list[0].shape[0], max_len), dtype=fine_tokens_list[0].dtype)
+    for i, ft in enumerate(fine_tokens_list):
+        padded[i, :, : ft.shape[1]] = ft
+
+    arr = torch.from_numpy(padded).to(device)  # [B, n_codes, T]
+    arr = arr.transpose(0, 1)                   # [n_codes, B, T]
+    emb = model.quantizer.decode(arr)
+    with torch.no_grad():
+        out = model.decoder(emb)
+    audio_all = out.cpu().detach().numpy()  # [1?, B, samples] or [B, 1, samples]
+    del arr, emb, out
+
+    if OFFLOAD_CPU:
+        model.to("cpu")
+
+    # EnCodec output shape may vary; flatten to [B, samples]
+    if audio_all.ndim == 3:
+        if audio_all.shape[0] == 1:
+            audio_all = audio_all[0]  # [B, samples]
+        elif audio_all.shape[1] == 1:
+            audio_all = audio_all.squeeze(1)  # [B, samples]
+
+    results = []
+    for i in range(B):
+        # compute expected sample count from token length
+        n_samples = int(lengths[i] / COARSE_RATE_HZ * SAMPLE_RATE)
+        results.append(audio_all[i, :n_samples])
+
+    _clear_cuda_cache()
+    return results

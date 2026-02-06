@@ -37,7 +37,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch nightly and still a bit scary
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash:
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -49,9 +48,8 @@ class CausalSelfAttention(nn.Module):
             )
 
     def forward(self, x, past_kv=None, use_cache=False):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
@@ -127,7 +125,9 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
 
     def forward(self, x, past_kv=None, use_cache=False):
-        attn_output, prev_kvs = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=use_cache)
+        attn_output, prev_kvs = self.attn(
+            self.ln_1(x), past_kv=past_kv, use_cache=use_cache,
+        )
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
         return (x, prev_kvs)
@@ -220,8 +220,7 @@ class GPT(nn.Module):
             position_ids = position_ids.unsqueeze(0)  # shape (1, t)
             assert position_ids.shape == (1, t)
 
-        pos_emb = self.transformer.wpe(position_ids)  # position embeddings of shape (1, t, n_embd)
-
+        pos_emb = self.transformer.wpe(position_ids)
         x = self.transformer.drop(tok_emb + pos_emb)
 
         new_kv = () if use_cache else None
