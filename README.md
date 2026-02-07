@@ -1,6 +1,16 @@
 # 🐶 Bark
 ## 🚀 Updates
 
+**2026.02**
+- **Long-form generation** (`generate_audio_long`): pass arbitrarily long text and it auto-splits at sentence boundaries (using BERT tokenizer counts), then runs all chunks through the batched pipeline
+- **Streaming output**: `generate_audio_long(stream=True)` returns a generator that yields audio segments as they decode, giving low time-to-first-audio
+  - Semantic tokens are generated for all text chunks in one batched pass, split into ~3 s sub-segments, then streamed through coarse/fine/codec
+- **Native audio playback**: `--play` flag streams audio directly to desktop speakers via `sounddevice` as it generates (no external tools needed)
+- **Interactive REPL**: `--interactive` keeps compiled models warm between runs for fast iteration
+- **Non-blocking I/O**: file writes and audio playback run on background threads; generation is never stalled by slow consumers (including FIFOs)
+- **True batched pipeline**: all four stages (semantic, coarse, fine, codec) now run with batch > 1 natively instead of sequential-per-prompt
+- **Performance**: top-p filtering runs entirely on GPU (no CPU round-trip), removed unnecessary `cuda.synchronize()` calls, vectorised codebook flattening
+
 **2025.05.17**
 - MultiGPU inference example added to run a large script and combine the outputs at the end
 - Uses torch.compile with max-autotune across all models by default
@@ -10,7 +20,7 @@
 
 On a 3x 4090 system, this can bring long inference job runtimes down from 2-5 minutes to 30-60 seconds.
 
-Bark is licensed under the MIT License, meaning it's now available for commercial use!  
+Bark is licensed under the MIT License, meaning it's now available for commercial use!
 
 ## Installation
 
@@ -20,9 +30,45 @@ cd bghira-bark
 python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -e .
+pip install sounddevice  # optional, for --play
 ```
 
 ## Usage
+
+### Single-GPU batched TTS
+
+```bash
+# One-shot generation (long text auto-splits):
+python examples/batch.py -t "Your long text here..." -v en_speaker_6
+
+# With live audio playback:
+python examples/batch.py -t "Hello world." -v en_speaker_6 --play
+
+# Interactive REPL (models stay compiled between runs):
+python examples/batch.py --interactive --play -v en_speaker_6
+
+# Multiple explicit prompts (batched):
+python examples/batch.py -t "Hello|World|Goodbye" -v en_speaker_6
+```
+
+### Long-form generation API
+
+```python
+from bark import generate_audio_long
+from bark.generation import SAMPLE_RATE, preload_models
+
+preload_models()
+
+# Returns a single concatenated numpy array:
+audio = generate_audio_long("Your long text here...", history_prompt="en_speaker_6")
+
+# Or stream segments as they decode:
+for segment in generate_audio_long("Long text...", history_prompt="en_speaker_6", stream=True):
+    # each segment is ~3 s of float32 audio at 24 kHz
+    pass
+```
+
+### MultiGPU inference
 
 This will run the example across all available GPUs without invoking torch compile:
 
